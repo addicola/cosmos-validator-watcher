@@ -8,6 +8,7 @@ import (
 
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/cosmos/cosmos-sdk/crypto/keys/ed25519"
+	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	"github.com/cosmos/cosmos-sdk/types/query"
 	staking "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/kilnfi/cosmos-validator-watcher/pkg/metrics"
@@ -98,8 +99,15 @@ func (w *ValidatorsWatcher) handleValidators(chainID string, validators []stakin
 		name := tracked.Name
 
 		for i, val := range validators {
-			pubkey := ed25519.PubKey{Key: val.ConsensusPubkey.Value[2:]}
-			address := pubkey.Address().String()
+			address := ""
+
+			if val.ConsensusPubkey.TypeUrl == "/cosmos.crypto.secp256k1.PubKey" {
+				pubkey := secp256k1.PubKey{Key: val.ConsensusPubkey.Value[2:]}
+				address = pubkey.Address().String()
+			} else if val.ConsensusPubkey.TypeUrl == "/cosmos.crypto.ed25519.PubKey" {
+				pubkey := ed25519.PubKey{Key: val.ConsensusPubkey.Value[2:]}
+				address = pubkey.Address().String()
+			}
 
 			if tracked.Address == address {
 				var (
