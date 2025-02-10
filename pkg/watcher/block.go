@@ -24,15 +24,14 @@ type BlockWebhook struct {
 }
 
 type BlockWatcher struct {
-	trackedValidators   []TrackedValidator
-	metrics             *metrics.Metrics
-	writer              io.Writer
-	blockChan           chan *BlockInfo
-	validatorSet        atomic.Value // []*types.Validator
-	latestBlockHeight   int64
-	latestBlockProposer string
-	webhook             *webhook.Webhook
-	customWebhooks      []BlockWebhook
+	trackedValidators []TrackedValidator
+	metrics           *metrics.Metrics
+	writer            io.Writer
+	blockChan         chan *BlockInfo
+	validatorSet      atomic.Value // []*types.Validator
+	latestBlock       BlockInfo
+	webhook           *webhook.Webhook
+	customWebhooks    []BlockWebhook
 }
 
 func NewBlockWatcher(validators []TrackedValidator, metrics *metrics.Metrics, writer io.Writer, webhook *webhook.Webhook, customWebhooks []BlockWebhook) *BlockWatcher {
@@ -172,22 +171,23 @@ func (w *BlockWatcher) syncValidatorSet(ctx context.Context, n *rpc.Node) error 
 func (w *BlockWatcher) handleBlockInfo(ctx context.Context, block *BlockInfo) {
 	chainId := block.ChainID
 
-	if w.latestBlockHeight >= block.Height {
+	if w.latestBlock.Height >= block.Height {
 		// Skip already processed blocks
 		return
 	}
 
-	// Ensure to inititalize counters for each validator
+	// Ensure to initialize counters for each validator
 	for _, val := range w.trackedValidators {
 		w.metrics.ValidatedBlocks.WithLabelValues(chainId, val.Address, val.Name)
 		w.metrics.MissedBlocks.WithLabelValues(chainId, val.Address, val.Name)
 		w.metrics.SoloMissedBlocks.WithLabelValues(chainId, val.Address, val.Name)
 		w.metrics.ConsecutiveMissedBlocks.WithLabelValues(chainId, val.Address, val.Name)
+		w.metrics.EmptyBlocks.WithLabelValues(chainId, val.Address, val.Name)
 	}
 	w.metrics.SkippedBlocks.WithLabelValues(chainId)
 
-	blockDiff := block.Height - w.latestBlockHeight
-	if w.latestBlockHeight > 0 && blockDiff > 1 {
+	blockDiff := block.Height - w.latestBlock.Height
+	if w.latestBlock.Height > 0 && blockDiff > 1 {
 		log.Warn().Msgf("skipped %d unknown blocks", blockDiff-1)
 		w.metrics.SkippedBlocks.WithLabelValues(chainId).Add(float64(blockDiff))
 	}
@@ -201,8 +201,14 @@ func (w *BlockWatcher) handleBlockInfo(ctx context.Context, block *BlockInfo) {
 	validatorStatus := []string{}
 	for _, res := range block.ValidatorStatus {
 		icon := "⚪️"
-		if w.latestBlockProposer == res.Address {
-			icon = "👑"
+		if w.latestBlock.ProposerAddress == res.Address {
+			// Check if this is an empty block
+			if w.latestBlock.Transactions == 0 {
+				icon = "🟡"
+				w.metrics.EmptyBlocks.WithLabelValues(block.ChainID, res.Address, res.Label).Inc()
+			} else {
+				icon = "👑"
+			}
 			w.metrics.ProposedBlocks.WithLabelValues(block.ChainID, res.Address, res.Label).Inc()
 			w.metrics.ValidatedBlocks.WithLabelValues(block.ChainID, res.Address, res.Label).Inc()
 			w.metrics.ConsecutiveMissedBlocks.WithLabelValues(block.ChainID, res.Address, res.Label).Set(0)
@@ -233,8 +239,8 @@ func (w *BlockWatcher) handleBlockInfo(ctx context.Context, block *BlockInfo) {
 	// Handle webhooks
 	w.handleWebhooks(ctx, block)
 
-	w.latestBlockHeight = block.Height
-	w.latestBlockProposer = block.ProposerAddress
+	// Save latest block
+	w.latestBlock = *block
 }
 
 func (w *BlockWatcher) computeValidatorStatus(block *types.Block) []ValidatorStatus {

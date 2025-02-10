@@ -9,14 +9,13 @@ import (
 	"strconv"
 	"syscall"
 
+	upgrade "cosmossdk.io/x/upgrade/types"
 	"github.com/cometbft/cometbft/rpc/client/http"
 	"github.com/cosmos/cosmos-sdk/client"
-	"github.com/cosmos/cosmos-sdk/crypto/keys/ed25519"
-	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	"github.com/cosmos/cosmos-sdk/types/query"
 	staking "github.com/cosmos/cosmos-sdk/x/staking/types"
 	"github.com/fatih/color"
-	_ "github.com/kilnfi/cosmos-validator-watcher/pkg/crypto"
+	"github.com/kilnfi/cosmos-validator-watcher/pkg/crypto"
 	"github.com/kilnfi/cosmos-validator-watcher/pkg/metrics"
 	"github.com/kilnfi/cosmos-validator-watcher/pkg/rpc"
 	"github.com/kilnfi/cosmos-validator-watcher/pkg/watcher"
@@ -34,6 +33,7 @@ func RunFunc(cCtx *cli.Context) error {
 
 		// Config flags
 		chainID             = cCtx.String("chain-id")
+		debug               = cCtx.Bool("debug")
 		httpAddr            = cCtx.String("http-addr")
 		logLevel            = cCtx.String("log-level")
 		namespace           = cCtx.String("namespace")
@@ -43,6 +43,7 @@ func RunFunc(cCtx *cli.Context) error {
 		noStaking           = cCtx.Bool("no-staking")
 		noUpgrade           = cCtx.Bool("no-upgrade")
 		noCommission        = cCtx.Bool("no-commission")
+		noSlashing          = cCtx.Bool("no-slashing")
 		denom               = cCtx.String("denom")
 		denomExpon          = cCtx.Uint("denom-exponent")
 		startTimeout        = cCtx.Duration("start-timeout")
@@ -51,6 +52,10 @@ func RunFunc(cCtx *cli.Context) error {
 		webhookURL          = cCtx.String("webhook-url")
 		webhookCustomBlocks = cCtx.StringSlice("webhook-custom-block")
 		xGov                = cCtx.String("x-gov")
+
+		// Babylon specific flags
+		babylonEnabled    = cCtx.Bool("babylon")
+		finalityProviders = cCtx.StringSlice("finality-provider")
 	)
 
 	//
@@ -60,6 +65,9 @@ func RunFunc(cCtx *cli.Context) error {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 	zerolog.SetGlobalLevel(logLevelFromString(logLevel))
+	if debug {
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	}
 
 	// Disable colored output if requested
 	color.NoColor = noColor
@@ -80,6 +88,25 @@ func RunFunc(cCtx *cli.Context) error {
 	if err != nil {
 		return err
 	}
+
+	// Detect cosmos modules to automatically disable features
+	modules, err := detectCosmosModules(startCtx, pool.GetSyncedNode())
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to detect cosmos modules")
+	} else {
+		noGov = !ensureCosmosModule("gov", modules) || noGov
+		noStaking = !ensureCosmosModule("staking", modules) || noStaking
+		noSlashing = !ensureCosmosModule("slashing", modules) || noSlashing
+		noCommission = !ensureCosmosModule("distribution", modules) || noCommission
+		noUpgrade = !ensureCosmosModule("upgrade", modules) || noUpgrade
+	}
+	log.Info().
+		Bool("commission", !noCommission).
+		Bool("gov", !noGov).
+		Bool("slashing", !noSlashing).
+		Bool("staking", !noStaking).
+		Bool("upgrade", !noUpgrade).
+		Msg("cosmos modules features status")
 
 	// Parse validators into name & address
 	trackedValidators, err := createTrackedValidators(ctx, pool, validators, noStaking)
@@ -128,6 +155,26 @@ func RunFunc(cCtx *cli.Context) error {
 			return commissionWatcher.Start(ctx)
 		})
 	}
+	if babylonEnabled {
+		finalityProviders := lo.Map(finalityProviders, func(val string, _ int) watcher.BabylonFinalityProvider {
+			return watcher.ParseBabylonFinalityProvider(val)
+		})
+		babylonWatcher := watcher.NewBabylonWatcher(trackedValidators, finalityProviders, pool, metrics, os.Stdout)
+		errg.Go(func() error {
+			return babylonWatcher.Start(ctx)
+		})
+		pool.OnNodeEvent(rpc.EventNewBlock, babylonWatcher.OnNewBlock)
+	}
+
+	//
+	// Slashing watchers
+	//
+	if !noSlashing {
+		slashingWatcher := watcher.NewSlashingWatcher(metrics, pool)
+		errg.Go(func() error {
+			return slashingWatcher.Start(ctx)
+		})
+	}
 
 	//
 	// Pool watchers
@@ -136,6 +183,7 @@ func RunFunc(cCtx *cli.Context) error {
 		validatorsWatcher := watcher.NewValidatorsWatcher(trackedValidators, metrics, pool, watcher.ValidatorsWatcherOptions{
 			Denom:         denom,
 			DenomExponent: denomExpon,
+			NoSlashing:    noSlashing,
 		})
 		errg.Go(func() error {
 			return validatorsWatcher.Start(ctx)
@@ -168,14 +216,11 @@ func RunFunc(cCtx *cli.Context) error {
 	//
 	// Register watchers on nodes events
 	//
-	for _, node := range pool.Nodes {
-		node.OnStart(blockWatcher.OnNodeStart)
-		node.OnStatus(statusWatcher.OnNodeStatus)
-		node.OnEvent(rpc.EventNewBlock, blockWatcher.OnNewBlock)
-
-		if upgradeWatcher != nil {
-			node.OnEvent(rpc.EventNewBlock, upgradeWatcher.OnNewBlock)
-		}
+	pool.OnNodeStart(blockWatcher.OnNodeStart)
+	pool.OnNodeStatus(statusWatcher.OnNodeStatus)
+	pool.OnNodeEvent(rpc.EventNewBlock, blockWatcher.OnNewBlock)
+	if upgradeWatcher != nil {
+		pool.OnNodeEvent(rpc.EventNewBlock, upgradeWatcher.OnNewBlock)
 	}
 
 	//
@@ -297,6 +342,36 @@ func createNodePool(ctx context.Context, nodes []string) (*rpc.Pool, error) {
 	return rpc.NewPool(chainID, rpcNodes), nil
 }
 
+func detectCosmosModules(ctx context.Context, node *rpc.Node) ([]*upgrade.ModuleVersion, error) {
+	if node == nil {
+		return nil, fmt.Errorf("no node available")
+	}
+
+	clientCtx := (client.Context{}).WithClient(node.Client)
+	queryClient := upgrade.NewQueryClient(clientCtx)
+	resp, err := queryClient.ModuleVersions(ctx, &upgrade.QueryModuleVersionsRequest{})
+	if err != nil {
+		return nil, err
+	}
+
+	log.Debug().Msgf("detected %d cosmos modules", len(resp.ModuleVersions))
+
+	for _, module := range resp.ModuleVersions {
+		log.Debug().Str("module", module.Name).Uint64("version", module.Version).Msg("detected cosmos module")
+	}
+
+	return resp.ModuleVersions, nil
+}
+
+func ensureCosmosModule(name string, modules []*upgrade.ModuleVersion) bool {
+	for _, module := range modules {
+		if module.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func createTrackedValidators(ctx context.Context, pool *rpc.Pool, validators []string, noStaking bool) ([]watcher.TrackedValidator, error) {
 	var stakingValidators []staking.Validator
 	if !noStaking {
@@ -319,19 +394,12 @@ func createTrackedValidators(ctx context.Context, pool *rpc.Pool, validators []s
 		val := watcher.ParseValidator(v)
 
 		for _, stakingVal := range stakingValidators {
-			address := ""
-
-			if stakingVal.ConsensusPubkey.TypeUrl == "/cosmos.crypto.secp256k1.PubKey" {
-				pubkey := secp256k1.PubKey{Key: stakingVal.ConsensusPubkey.Value[2:]}
-				address = pubkey.Address().String()
-			} else if stakingVal.ConsensusPubkey.TypeUrl == "/cosmos.crypto.ed25519.PubKey" {
-				pubkey := ed25519.PubKey{Key: stakingVal.ConsensusPubkey.Value[2:]}
-				address = pubkey.Address().String()
-			}
-
+			address := crypto.PubKeyAddress(stakingVal.ConsensusPubkey)
 			if address == val.Address {
+				hrp := crypto.GetHrpPrefix(stakingVal.OperatorAddress) + "valcons"
 				val.Moniker = stakingVal.Description.Moniker
 				val.OperatorAddress = stakingVal.OperatorAddress
+				val.ConsensusAddress = crypto.PubKeyBech32Address(stakingVal.ConsensusPubkey, hrp)
 			}
 		}
 
@@ -346,6 +414,7 @@ func createTrackedValidators(ctx context.Context, pool *rpc.Pool, validators []s
 			Str("alias", val.Name).
 			Str("moniker", val.Moniker).
 			Str("operator", val.OperatorAddress).
+			Str("consensus", val.ConsensusAddress).
 			Msgf("validator info")
 
 		return val

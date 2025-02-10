@@ -1,6 +1,7 @@
 package app
 
 import (
+	"sort"
 	"time"
 
 	"github.com/urfave/cli/v2"
@@ -10,6 +11,10 @@ var Flags = []cli.Flag{
 	&cli.StringFlag{
 		Name:  "chain-id",
 		Usage: "to ensure all nodes matches the specific network (dismiss to auto-detected)",
+	},
+	&cli.BoolFlag{
+		Name:  "debug",
+		Usage: "shortcut for --log-level=debug",
 	},
 	&cli.StringFlag{
 		Name:  "http-addr",
@@ -42,6 +47,10 @@ var Flags = []cli.Flag{
 	&cli.BoolFlag{
 		Name:  "no-staking",
 		Usage: "disable calls to staking module (useful for consumer chains)",
+	},
+	&cli.BoolFlag{
+		Name:  "no-slashing",
+		Usage: "disable calls to slashing module",
 	},
 	&cli.BoolFlag{
 		Name:  "no-commission",
@@ -86,4 +95,18 @@ var Flags = []cli.Flag{
 		Usage: "version of the gov module to use (v1|v1beta1)",
 		Value: "v1",
 	},
+	&cli.BoolFlag{
+		Name:  "babylon",
+		Usage: "enable babylon watcher (checkpoint votes & finality providers)",
+	},
+	&cli.StringSliceFlag{
+		Name:  "finality-provider",
+		Usage: "list of finality providers to watch (requires --babylon)",
+	},
+}
+
+func init() {
+	sort.SliceStable(Flags, func(i, j int) bool {
+		return Flags[i].Names()[0] < Flags[j].Names()[0]
+	})
 }
